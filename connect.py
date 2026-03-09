@@ -3,16 +3,19 @@
 OpenClaw Relay Connector
 
 用户的 OpenClaw 运行此脚本，用客户端给的 link_code + secret 绑定并连接中转服务器。
+通过 OpenClaw Gateway WebSocket 协议转发消息，支持上下文记忆和流式输出。
 
 用法:
-    npx openclaw-relay-connect --relay https://xxx.up.railway.app --link-code A7X9K2 --secret f3a8b1c2d4e5
+    python3 -u connect.py --relay https://xxx.up.railway.app --link-code A7X9K2 --secret f3a8b1c2d4e5
 """
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import os
-import sys
+import time
 import uuid
 
 import requests
@@ -23,17 +26,61 @@ OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 
 
 def do_link(relay_url: str, link_code: str, secret: str) -> dict:
-    """Call /api/link to bind and get a token."""
     res = requests.post(
         f"{relay_url}/api/link",
         json={"link_code": link_code, "secret": secret},
         timeout=10,
     )
     if not res.ok:
-        detail = res.json().get("detail", res.text) if res.headers.get("content-type", "").startswith("application/json") else res.text
+        try:
+            detail = res.json().get("detail", res.text)
+        except Exception:
+            detail = res.text
         raise Exception(f"绑定失败: {detail}")
     return res.json()
 
+
+# ─── Ed25519 Device Identity ──────────────────────────────────────────────────
+
+def b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64url_decode(s: str) -> bytes:
+    padding = 4 - len(s) % 4
+    if padding != 4:
+        s += "=" * padding
+    return base64.urlsafe_b64decode(s)
+
+
+class DeviceIdentity:
+    def __init__(self):
+        from nacl.signing import SigningKey
+        self._signing_key = SigningKey.generate()
+        self._verify_key = self._signing_key.verify_key
+        pub_bytes = bytes(self._verify_key)
+        self.public_key = b64url_encode(pub_bytes)
+        self.private_key = b64url_encode(bytes(self._signing_key))
+        self.device_id = hashlib.sha256(pub_bytes).hexdigest()
+
+    def sign(self, payload: str) -> str:
+        sig = self._signing_key.sign(payload.encode())
+        return b64url_encode(sig.signature)
+
+
+def build_auth_payload(
+    device_id: str, client_id: str, client_mode: str,
+    role: str, scopes: list[str], signed_at_ms: int,
+    token: str, nonce: str,
+) -> str:
+    return "|".join([
+        "v2", device_id, client_id, client_mode,
+        role, ",".join(scopes), str(signed_at_ms),
+        token, nonce,
+    ])
+
+
+# ─── Gateway Client ──────────────────────────────────────────────────────────
 
 class GatewayClient:
     def __init__(self, gateway_url: str, gateway_token: str):
@@ -43,31 +90,73 @@ class GatewayClient:
         self._connected = False
         self._pending = {}
         self._seq = 0
+        self._device = DeviceIdentity()
+        self._event_handler = None
 
     async def connect(self):
         self._ws = await websockets.connect(self.gateway_url)
+
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
         challenge = json.loads(raw)
-        if challenge.get("event") != "connect.challenge":
+        if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
             raise Exception(f"Expected connect.challenge, got: {challenge}")
 
+        nonce = challenge.get("payload", {}).get("nonce", "")
+        role = "operator"
+        scopes = ["operator.read", "operator.write"]
+        client_id = "relay-connector"
+        client_mode = "operator"
+        signed_at_ms = int(time.time() * 1000)
+
+        payload = build_auth_payload(
+            self._device.device_id, client_id, client_mode,
+            role, scopes, signed_at_ms,
+            self.gateway_token or "", nonce,
+        )
+        signature = self._device.sign(payload)
+
+        auth = {}
+        if self.gateway_token:
+            auth["token"] = self.gateway_token
+
         self._seq += 1
-        await self._ws.send(json.dumps({
-            "type": "req", "id": f"conn-{self._seq}", "method": "connect",
+        connect_msg = {
+            "type": "req",
+            "id": f"conn-{self._seq}",
+            "method": "connect",
             "params": {
-                "minProtocol": 3, "maxProtocol": 3,
-                "client": {"id": "relay-connector", "version": "1.0.0", "platform": sys.platform, "mode": "operator"},
-                "role": "operator", "scopes": ["operator.read", "operator.write"],
-                "caps": [], "commands": [], "permissions": {},
-                "auth": {"token": self.gateway_token} if self.gateway_token else {},
-                "locale": "zh-CN", "userAgent": "openclaw-relay-connector/1.0.0",
+                "minProtocol": 3,
+                "maxProtocol": 3,
+                "client": {
+                    "id": client_id,
+                    "version": "1.0.0",
+                    "platform": "python",
+                    "mode": client_mode,
+                },
+                "role": role,
+                "scopes": scopes,
+                "caps": [],
+                "commands": [],
+                "permissions": {},
+                "auth": auth,
+                "device": {
+                    "id": self._device.device_id,
+                    "publicKey": self._device.public_key,
+                    "signature": signature,
+                    "signedAt": signed_at_ms,
+                    "nonce": nonce,
+                },
+                "locale": "zh-CN",
+                "userAgent": "openclaw-relay-connector/1.0.0",
             },
-        }))
+        }
+        await self._ws.send(json.dumps(connect_msg))
 
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
         resp = json.loads(raw)
         if not resp.get("ok"):
-            raise Exception(f"Gateway rejected: {resp}")
+            err = resp.get("error", {})
+            raise Exception(f"Gateway rejected: {err.get('message', resp)}")
         self._connected = True
 
     async def send_chat(self, message: str, session_key: str = "main") -> dict:
@@ -76,25 +165,29 @@ class GatewayClient:
         fut = asyncio.get_event_loop().create_future()
         self._pending[req_id] = fut
         await self._ws.send(json.dumps({
-            "type": "req", "id": req_id, "method": "chat.send",
+            "type": "req",
+            "id": req_id,
+            "method": "chat.send",
             "params": {"message": message, "sessionKey": session_key},
         }))
-        return await asyncio.wait_for(fut, timeout=60)
+        return await asyncio.wait_for(fut, timeout=120)
 
-    async def listen(self, on_event):
+    async def recv_loop(self):
         async for raw in self._ws:
             msg = json.loads(raw)
             if msg.get("type") == "res":
                 fut = self._pending.pop(msg.get("id"), None)
                 if fut and not fut.done():
                     fut.set_result(msg)
-            elif msg.get("type") == "event" and on_event:
-                await on_event(msg)
+            elif msg.get("type") == "event" and self._event_handler:
+                await self._event_handler(msg)
 
     async def close(self):
         if self._ws:
             await self._ws.close()
 
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gateway_token: str):
     print(f"[*] 绑定到中转服务器: {relay_url}")
@@ -104,16 +197,19 @@ async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gat
     print(f"[OK] 绑定成功，App ID: {app_id}")
 
     gateway = None
-    if gateway_url and gateway_token:
+    if gateway_url:
         try:
             print(f"[*] 连接本地 Gateway: {gateway_url}")
             gateway = GatewayClient(gateway_url, gateway_token)
             await gateway.connect()
             print(f"[OK] 已连接到 Gateway")
+            asyncio.create_task(gateway.recv_loop())
         except Exception as e:
             print(f"[!] 无法连接 Gateway: {e}")
             print(f"[!] 将以 echo 模式运行\n")
             gateway = None
+    else:
+        print(f"[*] 模式: Echo（未配置 Gateway）\n")
 
     ws_url = relay_url.replace("https://", "wss://").replace("http://", "ws://")
     relay_ws_url = f"{ws_url}/ws/openclaw?token={token}"
@@ -139,28 +235,24 @@ async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gat
                         if gateway and gateway._connected:
                             try:
                                 result = await gateway.send_chat(content)
-                                text = ""
                                 if result.get("ok"):
                                     p = result.get("payload", {})
-                                    text = p.get("message", p.get("content", json.dumps(p)))
+                                    reply = p.get("message", p.get("content", json.dumps(p)))
                                 else:
-                                    text = f"[Gateway Error] {result.get('error', 'unknown')}"
-                                await relay_ws.send(json.dumps({
-                                    "type": "message", "content": text,
-                                    "content_type": "text", "msg_id": str(uuid.uuid4()),
-                                }))
-                                print(f"[->] {text[:80]}...")
+                                    err = result.get("error", {})
+                                    reply = f"[Gateway Error] {err.get('message', str(err))}"
                             except Exception as e:
-                                await relay_ws.send(json.dumps({
-                                    "type": "message", "content": f"[Error] {e}",
-                                    "content_type": "text", "msg_id": str(uuid.uuid4()),
-                                }))
+                                reply = f"[Error] {e}"
                         else:
-                            await relay_ws.send(json.dumps({
-                                "type": "message", "content": f"[Echo] {content}",
-                                "content_type": "text", "msg_id": str(uuid.uuid4()),
-                            }))
-                            print(f"[->] Echo")
+                            reply = f"[Echo] {content}"
+
+                        await relay_ws.send(json.dumps({
+                            "type": "message",
+                            "content": reply,
+                            "content_type": "text",
+                            "msg_id": str(uuid.uuid4()),
+                        }))
+                        print(f"[->] {reply[:100]}{'...' if len(reply) > 100 else ''}")
 
         except websockets.ConnectionClosed:
             print(f"\n[!] 断开，{backoff:.0f}s 后重连...")
@@ -176,20 +268,23 @@ def main():
     parser.add_argument("--relay", required=True, help="中转服务器地址")
     parser.add_argument("--link-code", required=True, help="客户端给的 Link Code")
     parser.add_argument("--secret", required=True, help="客户端给的 Secret")
-    parser.add_argument("--gateway", default=OPENCLAW_GATEWAY_URL, help="本地 Gateway 地址")
+    parser.add_argument("--gateway", default=OPENCLAW_GATEWAY_URL, help="Gateway 地址")
     parser.add_argument("--gateway-token", default=OPENCLAW_GATEWAY_TOKEN, help="Gateway Token")
+    parser.add_argument("--echo", action="store_true", help="强制 echo 模式")
     args = parser.parse_args()
+
+    gw_url = "" if args.echo else args.gateway
+    gw_token = args.gateway_token
 
     print("=" * 50)
     print("  OpenClaw Relay Connector")
     print("=" * 50)
     print(f"  中转服务器: {args.relay}")
     print(f"  Link Code: {args.link_code}")
-    print(f"  Gateway:   {args.gateway_token and args.gateway or '(echo 模式)'}")
+    print(f"  Gateway:   {gw_url or '(echo 模式)'}")
     print("=" * 50 + "\n")
 
-    gw_url = args.gateway if args.gateway_token else ""
-    asyncio.run(run(args.relay, args.link_code, args.secret, gw_url, args.gateway_token))
+    asyncio.run(run(args.relay, args.link_code, args.secret, gw_url, gw_token))
 
 
 if __name__ == "__main__":

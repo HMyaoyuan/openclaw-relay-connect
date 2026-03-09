@@ -94,24 +94,29 @@ class GatewayClient:
         self._event_handler = None
 
     async def connect(self):
-        self._ws = await websockets.connect(self.gateway_url)
+        self._ws = await websockets.connect(self.gateway_url, ping_interval=None)
 
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
         challenge = json.loads(raw)
         if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
             raise Exception(f"Expected connect.challenge, got: {challenge}")
 
-        nonce = challenge.get("payload", {}).get("nonce", "")
-        role = "operator"
-        scopes = ["operator.read", "operator.write"]
-        client_id = "relay-connector"
-        client_mode = "operator"
-        signed_at_ms = int(time.time() * 1000)
+        challenge_payload = challenge.get("payload", {})
+        nonce = challenge_payload.get("nonce", "")
+        signed_at_ms = challenge_payload.get("ts", int(time.time() * 1000))
 
+        role = "operator"
+        scopes = [
+            "operator.read", "operator.write", "operator.admin",
+            "operator.approvals", "operator.pairing",
+        ]
+        client_id = "cli"
+        client_mode = "cli"
+
+        signing_token = self.gateway_token or ""
         payload = build_auth_payload(
             self._device.device_id, client_id, client_mode,
-            role, scopes, signed_at_ms,
-            self.gateway_token or "", nonce,
+            role, scopes, signed_at_ms, signing_token, nonce,
         )
         signature = self._device.sign(payload)
 
@@ -135,9 +140,6 @@ class GatewayClient:
                 },
                 "role": role,
                 "scopes": scopes,
-                "caps": [],
-                "commands": [],
-                "permissions": {},
                 "auth": auth,
                 "device": {
                     "id": self._device.device_id,
@@ -148,6 +150,7 @@ class GatewayClient:
                 },
                 "locale": "zh-CN",
                 "userAgent": "openclaw-relay-connector/1.0.0",
+                "caps": ["tool-events"],
             },
         }
         await self._ws.send(json.dumps(connect_msg))
@@ -157,6 +160,12 @@ class GatewayClient:
         if not resp.get("ok"):
             err = resp.get("error", {})
             raise Exception(f"Gateway rejected: {err.get('message', resp)}")
+
+        resp_payload = resp.get("payload", {})
+        auth_data = resp_payload.get("auth", {})
+        device_token = auth_data.get("deviceToken")
+        if device_token:
+            self._device_token = device_token
         self._connected = True
 
     async def send_chat(self, message: str, session_key: str = "main") -> dict:

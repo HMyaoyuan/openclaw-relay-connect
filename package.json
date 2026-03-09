@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-relay-connect",
+  "version": "1.0.0",
+  "description": "Connect your OpenClaw/KimiClaw to the relay server",
+  "bin": {
+    "openclaw-relay-connect": "./bin/run.js"
+  },
+  "scripts": {
+    "start": "node bin/run.js"
+  },
+  "keywords": ["openclaw", "kimiclaw", "relay", "connector"],
+  "license": "MIT"
+}

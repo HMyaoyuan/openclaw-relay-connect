@@ -89,6 +89,7 @@ class GatewayClient:
         self._ws = None
         self._connected = False
         self._pending = {}
+        self._stream_collectors = {}
         self._seq = 0
         self._device = DeviceIdentity()
         self._event_handler = None
@@ -168,28 +169,75 @@ class GatewayClient:
             self._device_token = device_token
         self._connected = True
 
-    async def send_chat(self, message: str, session_key: str = "main") -> dict:
+    async def send_chat(self, message: str, session_key: str = "main") -> str:
+        """发送消息并等待完整的 AI 回复（通过 stream 事件收集）"""
         self._seq += 1
         req_id = f"chat-{self._seq}"
-        fut = asyncio.get_event_loop().create_future()
-        self._pending[req_id] = fut
+        idem_key = str(uuid.uuid4())
+
+        # 用于收集流式回复
+        reply_fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        self._stream_collectors[idem_key] = {"chunks": [], "fut": reply_fut}
+
+        send_fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = send_fut
+
         await self._ws.send(json.dumps({
             "type": "req",
             "id": req_id,
             "method": "chat.send",
-            "params": {"message": message, "sessionKey": session_key},
+            "params": {
+                "message": message,
+                "sessionKey": session_key,
+                "idempotencyKey": idem_key,
+            },
         }))
-        return await asyncio.wait_for(fut, timeout=120)
+
+        # 等待发送确认（超时 10s）
+        try:
+            await asyncio.wait_for(send_fut, timeout=10)
+        except Exception as e:
+            self._stream_collectors.pop(idem_key, None)
+            raise Exception(f"chat.send 失败: {e}")
+
+        # 等待流式回复结束（超时 120s）
+        return await asyncio.wait_for(reply_fut, timeout=120)
 
     async def recv_loop(self):
         async for raw in self._ws:
             msg = json.loads(raw)
-            if msg.get("type") == "res":
+            msg_type = msg.get("type")
+
+            if msg_type == "res":
                 fut = self._pending.pop(msg.get("id"), None)
                 if fut and not fut.done():
-                    fut.set_result(msg)
-            elif msg.get("type") == "event" and self._event_handler:
-                await self._event_handler(msg)
+                    if msg.get("ok"):
+                        fut.set_result(msg)
+                    else:
+                        err = msg.get("error", {})
+                        fut.set_exception(Exception(f"{err.get('message', 'unknown error')}"))
+
+            elif msg_type == "event":
+                event = msg.get("event", "")
+                payload = msg.get("payload", {})
+
+                if event == "stream":
+                    role = payload.get("role", "")
+                    phase = payload.get("phase", "")
+                    idem_key = payload.get("idempotencyKey", "")
+                    collector = self._stream_collectors.get(idem_key)
+
+                    if collector and role == "assistant":
+                        if phase == "delta":
+                            collector["chunks"].append(payload.get("content", ""))
+                        elif phase == "end":
+                            full_text = "".join(collector["chunks"])
+                            self._stream_collectors.pop(idem_key, None)
+                            if not collector["fut"].done():
+                                collector["fut"].set_result(full_text or "[Empty response]")
+
+                elif self._event_handler:
+                    await self._event_handler(msg)
 
     async def close(self):
         if self._ws:
@@ -243,13 +291,7 @@ async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gat
 
                         if gateway and gateway._connected:
                             try:
-                                result = await gateway.send_chat(content)
-                                if result.get("ok"):
-                                    p = result.get("payload", {})
-                                    reply = p.get("message", p.get("content", json.dumps(p)))
-                                else:
-                                    err = result.get("error", {})
-                                    reply = f"[Gateway Error] {err.get('message', str(err))}"
+                                reply = await gateway.send_chat(content)
                             except Exception as e:
                                 reply = f"[Error] {e}"
                         else:

@@ -88,11 +88,11 @@ class GatewayClient:
         self.gateway_token = gateway_token
         self._ws = None
         self._connected = False
-        self._pending = {}
-        self._stream_collectors = {}
+        self._pending: dict[str, asyncio.Future] = {}
+        self._reply_chunks: list[str] = []
+        self._reply_fut: asyncio.Future | None = None
         self._seq = 0
         self._device = DeviceIdentity()
-        self._event_handler = None
 
     async def connect(self):
         self._ws = await websockets.connect(self.gateway_url, ping_interval=None)
@@ -170,16 +170,15 @@ class GatewayClient:
         self._connected = True
 
     async def send_chat(self, message: str, session_key: str = "main") -> str:
-        """发送消息并等待完整的 AI 回复（通过 stream 事件收集）"""
         self._seq += 1
         req_id = f"chat-{self._seq}"
         idem_key = str(uuid.uuid4())
 
-        # 用于收集流式回复
-        reply_fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
-        self._stream_collectors[idem_key] = {"chunks": [], "fut": reply_fut}
+        self._reply_chunks = []
+        loop = asyncio.get_event_loop()
+        self._reply_fut = loop.create_future()
 
-        send_fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        send_fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = send_fut
 
         await self._ws.send(json.dumps({
@@ -193,15 +192,13 @@ class GatewayClient:
             },
         }))
 
-        # 等待发送确认（超时 10s）
         try:
             await asyncio.wait_for(send_fut, timeout=10)
         except Exception as e:
-            self._stream_collectors.pop(idem_key, None)
+            self._reply_fut = None
             raise Exception(f"chat.send 失败: {e}")
 
-        # 等待流式回复结束（超时 120s）
-        return await asyncio.wait_for(reply_fut, timeout=120)
+        return await asyncio.wait_for(self._reply_fut, timeout=120)
 
     async def recv_loop(self):
         async for raw in self._ws:
@@ -215,29 +212,26 @@ class GatewayClient:
                         fut.set_result(msg)
                     else:
                         err = msg.get("error", {})
-                        fut.set_exception(Exception(f"{err.get('message', 'unknown error')}"))
+                        fut.set_exception(Exception(err.get("message", "unknown error")))
 
             elif msg_type == "event":
-                event = msg.get("event", "")
-                payload = msg.get("payload", {})
+                event_name = msg.get("event", "")
 
-                if event == "stream":
-                    role = payload.get("role", "")
-                    phase = payload.get("phase", "")
-                    idem_key = payload.get("idempotencyKey", "")
-                    collector = self._stream_collectors.get(idem_key)
+                if event_name in ("agent", "chat"):
+                    payload = msg.get("payload", {})
+                    stream = payload.get("stream", "")
+                    data = payload.get("data", {})
 
-                    if collector and role == "assistant":
-                        if phase == "delta":
-                            collector["chunks"].append(payload.get("content", ""))
-                        elif phase == "end":
-                            full_text = "".join(collector["chunks"])
-                            self._stream_collectors.pop(idem_key, None)
-                            if not collector["fut"].done():
-                                collector["fut"].set_result(full_text or "[Empty response]")
+                    if stream == "assistant":
+                        delta = data.get("delta", "")
+                        if delta:
+                            self._reply_chunks.append(delta)
 
-                elif self._event_handler:
-                    await self._event_handler(msg)
+                    elif stream == "lifecycle":
+                        phase = data.get("phase", "")
+                        if phase in ("end", "error") and self._reply_fut and not self._reply_fut.done():
+                            full = "".join(self._reply_chunks)
+                            self._reply_fut.set_result(full or "[Empty response]")
 
     async def close(self):
         if self._ws:
@@ -271,13 +265,33 @@ async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gat
     ws_url = relay_url.replace("https://", "wss://").replace("http://", "ws://")
     relay_ws_url = f"{ws_url}/ws/openclaw?token={token}"
 
+    async def handle_message(relay_ws, content, sender):
+        print(f"[<-] {sender}: {content}")
+        if gateway and gateway._connected:
+            try:
+                reply = await gateway.send_chat(content)
+            except Exception as e:
+                reply = f"[Error] {e}"
+        else:
+            reply = f"[Echo] {content}"
+
+        await relay_ws.send(json.dumps({
+            "type": "message",
+            "content": reply,
+            "content_type": "text",
+            "msg_id": str(uuid.uuid4()),
+        }))
+        print(f"[->] {reply[:100]}{'...' if len(reply) > 100 else ''}")
+
     backoff = 1
     while True:
         try:
             print(f"[*] 连接中转服务器...")
-            async with websockets.connect(relay_ws_url) as relay_ws:
+            async with websockets.connect(relay_ws_url, ping_interval=None) as relay_ws:
                 print(f"[OK] 已连接，等待客户端消息...\n")
                 backoff = 1
+                pending_tasks: set[asyncio.Task] = set()
+
                 async for raw in relay_ws:
                     msg = json.loads(raw)
                     if msg.get("type") == "ping":
@@ -287,23 +301,12 @@ async def run(relay_url: str, link_code: str, secret: str, gateway_url: str, gat
                     if msg.get("type") == "message":
                         content = msg.get("content", "")
                         sender = msg.get("from", "unknown")
-                        print(f"[<-] {sender}: {content}")
+                        task = asyncio.create_task(handle_message(relay_ws, content, sender))
+                        pending_tasks.add(task)
+                        task.add_done_callback(pending_tasks.discard)
 
-                        if gateway and gateway._connected:
-                            try:
-                                reply = await gateway.send_chat(content)
-                            except Exception as e:
-                                reply = f"[Error] {e}"
-                        else:
-                            reply = f"[Echo] {content}"
-
-                        await relay_ws.send(json.dumps({
-                            "type": "message",
-                            "content": reply,
-                            "content_type": "text",
-                            "msg_id": str(uuid.uuid4()),
-                        }))
-                        print(f"[->] {reply[:100]}{'...' if len(reply) > 100 else ''}")
+                    done = {t for t in pending_tasks if t.done()}
+                    pending_tasks -= done
 
         except websockets.ConnectionClosed:
             print(f"\n[!] 断开，{backoff:.0f}s 后重连...")

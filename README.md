@@ -2,7 +2,18 @@
 
 将你的 OpenClaw 连接到中转服务器，让客户端 App 可以远程与之对话。
 
-通过 OpenClaw Gateway 协议（Ed25519 设备签名）连接本地 AI，支持上下文记忆。
+## 安全架构
+
+本脚本采用**安全隔离**设计：
+- **不直接连接** Gateway WebSocket，不持有任何系统级权限
+- 通过 OpenClaw 官方 CLI (`openclaw agent --message`) 安全地发送聊天消息
+- 即使中转服务器被攻破，攻击者最多只能发送聊天文本，**无法执行任何命令**
+- 中转服务器对所有消息进行白名单校验，只允许纯文本聊天消息通过
+
+## 前置条件
+
+- Python 3.10+
+- OpenClaw CLI 已安装并在 PATH 中（`openclaw` 命令可用）
 
 ## 快速开始
 
@@ -24,27 +35,25 @@ python3 -u connect.py \
 | `--relay` | 是 | 中转服务器地址 |
 | `--link-code` | 是 | 客户端 App 生成的 Link Code |
 | `--secret` | 是 | 客户端 App 生成的 Secret |
-| `--gateway` | 否 | 本地 OpenClaw Gateway 地址（默认 `ws://127.0.0.1:18789`） |
-| `--gateway-token` | 否 | Gateway 认证 Token（如果设置了密码） |
-| `--echo` | 否 | 强制 echo 模式（不连接 Gateway，原样返回消息） |
 
 ## 环境变量
 
-也可以通过环境变量配置 Gateway：
-
-```bash
-export OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789
-export OPENCLAW_GATEWAY_TOKEN=你的token
-```
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OPENCLAW_CLI` | `openclaw` | OpenClaw CLI 可执行文件路径 |
 
 ## 工作原理
 
-1. 用客户端给的 Link Code + Secret 绑定到中转服务器
-2. 生成 Ed25519 密钥对，连接本地 OpenClaw Gateway（设备签名认证）
-3. 建立 WebSocket 长连接到中转服务器
-4. 接收客户端消息 → 转发给 Gateway → 将 AI 回复转发回客户端
+```
+客户端 App  ←→  中转服务器 (Railway)  ←→  connect.py  →  openclaw CLI  →  AI
+```
 
-不提供 Gateway 地址或连接失败时自动降级为 Echo 模式。
+1. 用客户端给的 Link Code + Secret 绑定到中转服务器
+2. 建立 WebSocket 长连接到中转服务器，等待客户端消息
+3. 收到消息后，调用 `openclaw agent --message "消息内容"` 获取 AI 回复
+4. 将纯文本回复推回中转服务器，转发给客户端
+
+找不到 `openclaw` 命令时自动降级为 Echo 模式（原样返回消息）。
 
 ## 后台运行
 
@@ -55,3 +64,10 @@ nohup python3 -u connect.py \
   --secret xxxxxxxx \
   > connector.log 2>&1 &
 ```
+
+## 安全说明
+
+- 脚本只调用 `openclaw agent --message`，这是一个只读聊天接口
+- 不使用 Gateway WebSocket 协议，不持有 Ed25519 密钥
+- 不请求 `operator.admin`、`operator.approvals` 等高权限 scope
+- 中转服务器对消息类型和长度进行严格校验

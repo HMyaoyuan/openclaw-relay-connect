@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import uuid
 
@@ -28,6 +29,7 @@ import websockets
 MAX_MESSAGE_LENGTH = 50000
 OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")
 DEFAULT_SESSION_LABEL = os.getenv("OPENCLAW_SESSION_LABEL", "mobile-app")
+VALID_EMOTIONS = {"speechless", "angry", "shy", "sad", "happy", "neutral"}
 
 
 def do_link(relay_url: str, link_code: str, secret: str) -> dict:
@@ -78,6 +80,70 @@ async def call_openclaw_cli(message: str, label: str = DEFAULT_SESSION_LABEL, ti
         return f"[Error] {e}"
 
 
+def strip_thinking(raw: str) -> str:
+    """Remove AI thinking blocks from the reply."""
+    lines = raw.split("\n")
+    cleaned = []
+    in_think = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("> think") or stripped == "<think>" or stripped == "<thinking>":
+            in_think = True
+            continue
+        if in_think:
+            if stripped == "</think>" or stripped == "</thinking>" or (not stripped.startswith(">") and not stripped.startswith("**") and cleaned == [] and stripped == ""):
+                in_think = False
+            elif not stripped.startswith(">") and not stripped.startswith("**") and stripped:
+                in_think = False
+                cleaned.append(line)
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def parse_reply(raw: str) -> tuple[str, str]:
+    """
+    Extract emotion and text from AI reply.
+    Supports: {"emotion":"happy","text":"..."} or (happy) text
+    Returns (emotion, clean_text).
+    """
+    text = strip_thinking(raw)
+    if not text:
+        return "neutral", "[Empty response]"
+
+    # Try JSON: {"emotion": "...", "text": "..."}
+    try:
+        json_start = text.index("{")
+        json_candidate = text[json_start:]
+        brace_depth = 0
+        json_end = json_start
+        for i, ch in enumerate(json_candidate):
+            if ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    json_end = i + 1
+                    break
+        obj = json.loads(json_candidate[:json_end])
+        emo = str(obj.get("emotion", "neutral")).lower().strip()
+        t = str(obj.get("text", "")).strip()
+        if t:
+            return emo if emo in VALID_EMOTIONS else "neutral", t
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try legacy: (emotion) text
+    m = re.match(r"^\((.*?)\)\s*(.*)", text, re.DOTALL)
+    if m:
+        emo = m.group(1).lower().strip()
+        t = m.group(2).strip()
+        if t and emo in VALID_EMOTIONS:
+            return emo, t
+
+    return "neutral", text
+
+
 async def run(relay_url: str, link_code: str, secret: str, label: str):
     print(f"[*] 绑定到中转服务器: {relay_url}")
     result = do_link(relay_url, link_code, secret)
@@ -104,17 +170,20 @@ async def run(relay_url: str, link_code: str, secret: str, label: str):
         print(f"[<-] {sender}: {content}")
 
         if cli_path:
-            reply = await call_openclaw_cli(content, label=label)
+            raw_reply = await call_openclaw_cli(content, label=label)
         else:
-            reply = f"[Echo] {content}"
+            raw_reply = f"[Echo] {content}"
+
+        emotion, clean_text = parse_reply(raw_reply)
 
         await relay_ws.send(json.dumps({
             "type": "message",
-            "content": reply,
+            "content": clean_text,
             "content_type": "text",
+            "emotion": emotion,
             "msg_id": str(uuid.uuid4()),
         }))
-        print(f"[->] {reply[:100]}{'...' if len(reply) > 100 else ''}")
+        print(f"[->] ({emotion}) {clean_text[:100]}{'...' if len(clean_text) > 100 else ''}")
 
     backoff = 1
     while True:

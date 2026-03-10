@@ -31,6 +31,15 @@ OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")
 DEFAULT_SESSION_LABEL = os.getenv("OPENCLAW_SESSION_LABEL", "mobile-app")
 VALID_EMOTIONS = {"speechless", "angry", "shy", "sad", "happy", "neutral"}
 
+EMOTION_PROMPT = (
+    '你现在是一个桌面宠物，正在和主人实时语音对话。'
+    '你的每句回复都会被TTS朗读出来，所以必须简短口语化。\n'
+    '回复要求：用一句话回答，20-30字中文最佳，不许超过50字中文。像朋友聊天一样说话，不要写长段落。\n'
+    '输出格式（严格JSON，不要输出其他任何内容）：\n'
+    '{{"emotion":"<happy|sad|angry|shy|speechless|neutral>","text":"你的简短回复"}}\n\n'
+    '主人说：{message}'
+)
+
 
 def do_link(relay_url: str, link_code: str, secret: str) -> dict:
     res = requests.post(
@@ -82,21 +91,32 @@ async def call_openclaw_cli(message: str, label: str = DEFAULT_SESSION_LABEL, ti
 
 def strip_thinking(raw: str) -> str:
     """Remove AI thinking blocks from the reply."""
-    lines = raw.split("\n")
+    import re as _re
+
+    result = _re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=_re.IGNORECASE)
+    result = _re.sub(r"<thinking>[\s\S]*?</thinking>", "", result, flags=_re.IGNORECASE)
+
+    lines = result.split("\n")
     cleaned = []
     in_think = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("> think") or stripped == "<think>" or stripped == "<thinking>":
+        if (
+            stripped.startswith("> think")
+            or stripped == "<think>"
+            or stripped == "<thinking>"
+            or _re.match(r"^>\s*\*\*Thinking", stripped, _re.IGNORECASE)
+            or _re.match(r"^Thinking Process:", stripped, _re.IGNORECASE)
+        ):
             in_think = True
             continue
         if in_think:
-            if stripped == "</think>" or stripped == "</thinking>" or (not stripped.startswith(">") and not stripped.startswith("**") and cleaned == [] and stripped == ""):
+            if stripped in ("</think>", "</thinking>", "---"):
                 in_think = False
-            elif not stripped.startswith(">") and not stripped.startswith("**") and stripped:
-                in_think = False
-                cleaned.append(line)
-            continue
+                continue
+            if stripped.startswith(">") or stripped.startswith("**") or stripped == "":
+                continue
+            in_think = False
         cleaned.append(line)
     return "\n".join(cleaned).strip()
 
@@ -170,7 +190,8 @@ async def run(relay_url: str, link_code: str, secret: str, label: str):
         print(f"[<-] {sender}: {content}")
 
         if cli_path:
-            raw_reply = await call_openclaw_cli(content, label=label)
+            wrapped = EMOTION_PROMPT.format(message=content)
+            raw_reply = await call_openclaw_cli(wrapped, label=label)
         else:
             raw_reply = f"[Echo] {content}"
 

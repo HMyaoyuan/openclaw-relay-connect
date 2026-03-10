@@ -4,8 +4,8 @@ OpenClaw Relay Connector (Secure Channel Worker)
 
 安全架构：本脚本只负责搬运纯文本聊天消息。
 - 从中转服务器接收客户端消息
-- 通过 OpenClaw CLI (`openclaw send --label`) 安全地发送给 AI
-- 使用 --label 绑定专属会话，自动维护上下文记忆
+- 通过 OpenClaw CLI (`openclaw agent --session-id --message`) 安全地发送给 AI
+- 使用 --session-id 绑定专属会话，自动维护上下文记忆
 - 将 AI 的纯文本回复推回中转服务器
 
 不直接连接 Gateway WebSocket，不持有任何系统级权限。
@@ -47,8 +47,8 @@ def do_link(relay_url: str, link_code: str, secret: str) -> dict:
 
 async def call_openclaw_cli(message: str, label: str = DEFAULT_SESSION_LABEL, timeout: float = 120) -> str:
     """
-    Send a message via the official CLI with a dedicated session label.
-    The --label ensures all messages from this client share the same
+    Send a message via the official CLI with a dedicated session ID.
+    The --session-id ensures all messages from this client share the same
     conversation context, while staying isolated from the main terminal session.
     """
     if len(message) > MAX_MESSAGE_LENGTH:
@@ -60,7 +60,7 @@ async def call_openclaw_cli(message: str, label: str = DEFAULT_SESSION_LABEL, ti
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            cli_path, "send", "--label", label, message,
+            cli_path, "agent", "--session-id", label, "--message", message,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

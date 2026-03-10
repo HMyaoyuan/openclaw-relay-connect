@@ -4,7 +4,8 @@ OpenClaw Relay Connector (Secure Channel Worker)
 
 安全架构：本脚本只负责搬运纯文本聊天消息。
 - 从中转服务器接收客户端消息
-- 通过 OpenClaw CLI (`openclaw agent --message`) 安全地发送给 AI
+- 通过 OpenClaw CLI (`openclaw send --label`) 安全地发送给 AI
+- 使用 --label 绑定专属会话，自动维护上下文记忆
 - 将 AI 的纯文本回复推回中转服务器
 
 不直接连接 Gateway WebSocket，不持有任何系统级权限。
@@ -26,6 +27,7 @@ import websockets
 
 MAX_MESSAGE_LENGTH = 50000
 OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")
+DEFAULT_SESSION_LABEL = os.getenv("OPENCLAW_SESSION_LABEL", "mobile-app")
 
 
 def do_link(relay_url: str, link_code: str, secret: str) -> dict:
@@ -43,11 +45,11 @@ def do_link(relay_url: str, link_code: str, secret: str) -> dict:
     return res.json()
 
 
-async def call_openclaw_cli(message: str, timeout: float = 120) -> str:
+async def call_openclaw_cli(message: str, label: str = DEFAULT_SESSION_LABEL, timeout: float = 120) -> str:
     """
-    Through the official CLI, send a message as a normal user chat.
-    This is the security boundary: the CLI handles permissions internally,
-    and this script never touches the Gateway or any system-level API.
+    Send a message via the official CLI with a dedicated session label.
+    The --label ensures all messages from this client share the same
+    conversation context, while staying isolated from the main terminal session.
     """
     if len(message) > MAX_MESSAGE_LENGTH:
         return "[Error] 消息过长"
@@ -58,7 +60,7 @@ async def call_openclaw_cli(message: str, timeout: float = 120) -> str:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            cli_path, "agent", "--message", message,
+            cli_path, "send", "--label", label, message,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -76,7 +78,7 @@ async def call_openclaw_cli(message: str, timeout: float = 120) -> str:
         return f"[Error] {e}"
 
 
-async def run(relay_url: str, link_code: str, secret: str):
+async def run(relay_url: str, link_code: str, secret: str, label: str):
     print(f"[*] 绑定到中转服务器: {relay_url}")
     result = do_link(relay_url, link_code, secret)
     token = result["token"]
@@ -86,6 +88,7 @@ async def run(relay_url: str, link_code: str, secret: str):
     cli_path = shutil.which(OPENCLAW_CLI)
     if cli_path:
         print(f"[OK] OpenClaw CLI: {cli_path}")
+        print(f"[OK] 会话标签: {label}")
     else:
         print(f"[!] 警告: 找不到 '{OPENCLAW_CLI}' 命令，将以 echo 模式运行")
         print(f"[!] 请安装 OpenClaw CLI 或设置 OPENCLAW_CLI 环境变量\n")
@@ -101,7 +104,7 @@ async def run(relay_url: str, link_code: str, secret: str):
         print(f"[<-] {sender}: {content}")
 
         if cli_path:
-            reply = await call_openclaw_cli(content)
+            reply = await call_openclaw_cli(content, label=label)
         else:
             reply = f"[Echo] {content}"
 
@@ -154,6 +157,8 @@ def main():
     parser.add_argument("--relay", required=True, help="中转服务器地址")
     parser.add_argument("--link-code", required=True, help="客户端给的 Link Code")
     parser.add_argument("--secret", required=True, help="客户端给的 Secret")
+    parser.add_argument("--label", default=DEFAULT_SESSION_LABEL,
+                        help=f"OpenClaw 会话标签，用于隔离上下文（默认: {DEFAULT_SESSION_LABEL}）")
     args = parser.parse_args()
 
     print("=" * 50)
@@ -161,10 +166,11 @@ def main():
     print("=" * 50)
     print(f"  中转服务器: {args.relay}")
     print(f"  Link Code:  {args.link_code}")
+    print(f"  会话标签:   {args.label}")
     print(f"  模式:       CLI (安全隔离)")
     print("=" * 50 + "\n")
 
-    asyncio.run(run(args.relay, args.link_code, args.secret))
+    asyncio.run(run(args.relay, args.link_code, args.secret, args.label))
 
 
 if __name__ == "__main__":

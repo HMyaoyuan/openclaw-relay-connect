@@ -91,6 +91,7 @@ class GatewayClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._reply_chunks: list[str] = []
         self._reply_fut: asyncio.Future | None = None
+        self._chat_lock = asyncio.Lock()
         self._seq = 0
         self._device = DeviceIdentity()
 
@@ -170,35 +171,36 @@ class GatewayClient:
         self._connected = True
 
     async def send_chat(self, message: str, session_key: str = "main") -> str:
-        self._seq += 1
-        req_id = f"chat-{self._seq}"
-        idem_key = str(uuid.uuid4())
+        async with self._chat_lock:
+            self._seq += 1
+            req_id = f"chat-{self._seq}"
+            idem_key = str(uuid.uuid4())
 
-        self._reply_chunks = []
-        loop = asyncio.get_event_loop()
-        self._reply_fut = loop.create_future()
+            self._reply_chunks = []
+            loop = asyncio.get_event_loop()
+            self._reply_fut = loop.create_future()
 
-        send_fut: asyncio.Future = loop.create_future()
-        self._pending[req_id] = send_fut
+            send_fut: asyncio.Future = loop.create_future()
+            self._pending[req_id] = send_fut
 
-        await self._ws.send(json.dumps({
-            "type": "req",
-            "id": req_id,
-            "method": "chat.send",
-            "params": {
-                "message": message,
-                "sessionKey": session_key,
-                "idempotencyKey": idem_key,
-            },
-        }))
+            await self._ws.send(json.dumps({
+                "type": "req",
+                "id": req_id,
+                "method": "chat.send",
+                "params": {
+                    "message": message,
+                    "sessionKey": session_key,
+                    "idempotencyKey": idem_key,
+                },
+            }))
 
-        try:
-            await asyncio.wait_for(send_fut, timeout=10)
-        except Exception as e:
-            self._reply_fut = None
-            raise Exception(f"chat.send 失败: {e}")
+            try:
+                await asyncio.wait_for(send_fut, timeout=10)
+            except Exception as e:
+                self._reply_fut = None
+                raise Exception(f"chat.send 失败: {e}")
 
-        return await asyncio.wait_for(self._reply_fut, timeout=120)
+            return await asyncio.wait_for(self._reply_fut, timeout=120)
 
     async def recv_loop(self):
         async for raw in self._ws:

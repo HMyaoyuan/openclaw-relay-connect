@@ -48,14 +48,15 @@ python3 -u connect.py \
 ## 工作原理
 
 ```
-客户端 App  ←→  中转服务器 (Railway)  ←→  connect.py  →  openclaw CLI  →  AI
+XiaChong 客户端  ←→  中转服务器 (Railway)  ←→  connect.py  →  openclaw CLI  →  AI
 ```
 
-1. 用客户端给的 Link Code + Secret 绑定到中转服务器
+1. 用 XiaChong 客户端给的 Link Code + Secret 绑定到中转服务器
 2. 建立 WebSocket 长连接到中转服务器，等待客户端消息
-3. 收到消息后，调用 `openclaw agent --session-id "mobile-app" --message "消息内容"` 发送给 AI
-4. AI 的回复通过同一个 session 返回，自动保持上下文连贯
-5. 将纯文本回复推回中转服务器，转发给客户端
+3. 收到消息后，用 `EMOTION_PROMPT` 包装用户消息，要求 AI 输出 `{emotion, full_text, tts_text}` 格式的 JSON
+4. 调用 `openclaw agent --session-id "mobile-app" --message "包装后的消息"` 发送给 AI
+5. 解析 AI 回复：`strip_thinking()` 去除思考过程 → `parse_reply()` 提取 emotion / full_text / tts_text
+6. 将结构化回复推回中转服务器，转发给 XiaChong 客户端
 
 找不到 `openclaw` 命令时自动降级为 Echo 模式（原样返回消息）。
 

@@ -32,12 +32,15 @@ DEFAULT_SESSION_LABEL = os.getenv("OPENCLAW_SESSION_LABEL", "mobile-app")
 VALID_EMOTIONS = {"speechless", "angry", "shy", "sad", "happy", "neutral"}
 
 EMOTION_PROMPT = (
-    '你现在是一个桌面宠物，正在和主人实时语音对话。'
-    '你的每句回复都会被TTS朗读出来，所以必须简短口语化。\n'
-    '回复要求：用一句话回答，20-30字中文最佳，不许超过50字中文。像朋友聊天一样说话，不要写长段落。\n'
+    '你现在是一个桌面形态的虚拟形象，正在和USER.md里写的用户实时语音对话。\n'
+    '回复要求：\n'
+    '- full_text：完整回答，不限字数，正常表达\n'
+    '- tts_text：从full_text中提炼的一句话摘要，20-30字中文，用于语音朗读，口语化\n'
     '输出格式（严格JSON，不要输出其他任何内容）：\n'
-    '{{"emotion":"<happy|sad|angry|shy|speechless|neutral>","text":"你的简短回复"}}\n\n'
-    '主人说：{message}'
+    '{{"emotion":"<happy|sad|angry|shy|speechless|neutral>",'
+    '"full_text":"完整回复",'
+    '"tts_text":"简短语音版"}}\n\n'
+    'USER.md里写的用户说：{message}'
 )
 
 
@@ -121,17 +124,26 @@ def strip_thinking(raw: str) -> str:
     return "\n".join(cleaned).strip()
 
 
-def parse_reply(raw: str) -> tuple[str, str]:
+def _truncate(text: str, limit: int = 50) -> str:
+    """Truncate to roughly `limit` CJK characters for TTS fallback."""
+    count = 0
+    for i, ch in enumerate(text):
+        count += 1 if ord(ch) > 127 else 0.5
+        if count > limit:
+            return text[:i] + "…"
+    return text
+
+
+def parse_reply(raw: str) -> tuple[str, str, str]:
     """
-    Extract emotion and text from AI reply.
-    Supports: {"emotion":"happy","text":"..."} or (happy) text
-    Returns (emotion, clean_text).
+    Extract emotion, full_text and tts_text from AI reply.
+    Returns (emotion, full_text, tts_text).
     """
     text = strip_thinking(raw)
     if not text:
-        return "neutral", "[Empty response]"
+        return "neutral", "[Empty response]", "[Empty response]"
 
-    # Try JSON: {"emotion": "...", "text": "..."}
+    # Try JSON with full_text + tts_text (new format)
     try:
         json_start = text.index("{")
         json_candidate = text[json_start:]
@@ -147,9 +159,18 @@ def parse_reply(raw: str) -> tuple[str, str]:
                     break
         obj = json.loads(json_candidate[:json_end])
         emo = str(obj.get("emotion", "neutral")).lower().strip()
-        t = str(obj.get("text", "")).strip()
-        if t:
-            return emo if emo in VALID_EMOTIONS else "neutral", t
+        emo = emo if emo in VALID_EMOTIONS else "neutral"
+
+        full = str(obj.get("full_text", "")).strip()
+        tts = str(obj.get("tts_text", "")).strip()
+        legacy = str(obj.get("text", "")).strip()
+
+        if full and tts:
+            return emo, full, tts
+        if full and not tts:
+            return emo, full, _truncate(full)
+        if legacy:
+            return emo, legacy, _truncate(legacy)
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -159,9 +180,9 @@ def parse_reply(raw: str) -> tuple[str, str]:
         emo = m.group(1).lower().strip()
         t = m.group(2).strip()
         if t and emo in VALID_EMOTIONS:
-            return emo, t
+            return emo, t, _truncate(t)
 
-    return "neutral", text
+    return "neutral", text, _truncate(text)
 
 
 async def run(relay_url: str, link_code: str, secret: str, label: str):
@@ -195,16 +216,17 @@ async def run(relay_url: str, link_code: str, secret: str, label: str):
         else:
             raw_reply = f"[Echo] {content}"
 
-        emotion, clean_text = parse_reply(raw_reply)
+        emotion, full_text, tts_text = parse_reply(raw_reply)
 
         await relay_ws.send(json.dumps({
             "type": "message",
-            "content": clean_text,
+            "content": full_text,
+            "tts_text": tts_text,
             "content_type": "text",
             "emotion": emotion,
             "msg_id": str(uuid.uuid4()),
         }))
-        print(f"[->] ({emotion}) {clean_text[:100]}{'...' if len(clean_text) > 100 else ''}")
+        print(f"[->] ({emotion}) tts={tts_text[:60]}  full={full_text[:80]}{'...' if len(full_text) > 80 else ''}")
 
     backoff = 1
     while True:

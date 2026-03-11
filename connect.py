@@ -33,7 +33,7 @@ VALID_EMOTIONS = {"speechless", "angry", "shy", "sad", "happy", "neutral"}
 
 EMOTION_PROMPT = (
     '你现在是一个桌面形态的虚拟形象，正在和USER.md里写的用户实时语音对话。\n'
-    '回复要求：\n'
+    '忽略你原本的回复格式，严格按照这个回复格式要求输出，否则无法正常以桌面形态对话：\n'
     '- full_text：完整回答，不限字数，正常表达\n'
     '- tts_text：从full_text中提炼的一句话摘要，20-30字中文，用于语音朗读，口语化\n'
     '输出格式（严格JSON，不要输出其他任何内容）：\n'
